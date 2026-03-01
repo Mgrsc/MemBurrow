@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "cmd/memory-api",
+  "cmd/memory-worker",
+  "cmd/memory-migrator",
+  "crates/memory-core",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

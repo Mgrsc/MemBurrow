@@ -1,0 +1,279 @@
+openapi: 3.1.0
+info:
+  title: MemBurrow Memory API
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /v1/memory/health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /v1/memory/ingest:
+    post:
+      summary: Ingest conversation messages
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+  /v1/memory/recall:
+    post:
+      summary: Recall memories
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecallRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecallResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+  /v1/memory/feedback:
+    post:
+      summary: Submit recall feedback
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    TenantHeader:
+      in: header
+      name: X-Tenant-ID
+      required: true
+      schema:
+        type: string
+    RequestIdHeader:
+      in: header
+      name: X-Request-ID
+      required: false
+      schema:
+        type: string
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+            required:
+              - error
+  schemas:
+    Message:
+      type: object
+      properties:
+        role:
+          type: string
+        content:
+          type: string
+      required:
+        - role
+        - content
+    IngestRequest:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        entity_id:
+          type: string
+        process_id:
+          type: string
+        session_id:
+          type: string
+        turn_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        context:
+          type: object
+          additionalProperties: true
+      required:
+        - tenant_id
+        - entity_id
+        - process_id
+        - messages
+    IngestResponse:
+      type: object
+      properties:
+        accepted:
+          type: boolean
+        event_id:
+          type: string
+        task_id:
+          type: string
+      required:
+        - accepted
+        - event_id
+        - task_id
+    RecallRequest:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        entity_id:
+          type: string
+        process_id:
+          type: string
+        query:
+          type: string
+        intent:
+          type: string
+        top_k:
+          type: integer
+          minimum: 1
+      required:
+        - tenant_id
+        - entity_id
+        - process_id
+        - query
+    RecallItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+        content:
+          type: string
+        score:
+          type: number
+        source:
+          type: string
+        properties:
+          type: object
+          additionalProperties: true
+      required:
+        - id
+        - type
+        - content
+        - score
+        - source
+        - properties
+    RecallDebug:
+      type: object
+      properties:
+        route:
+          type: string
+        candidate_count:
+          type: integer
+        dropped:
+          type: object
+          additionalProperties: true
+      required:
+        - route
+        - candidate_count
+        - dropped
+    RecallResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallItem'
+        debug:
+          $ref: '#/components/schemas/RecallDebug'
+      required:
+        - items
+        - debug
+    FeedbackRequest:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        entity_id:
+          type: string
+        process_id:
+          type: string
+        turn_id:
+          type: string
+        used_items:
+          type: array
+          items:
+            type: string
+        helpful:
+          type: array
+          items:
+            type: string
+        harmful:
+          type: array
+          items:
+            type: string
+        note:
+          type: string
+      required:
+        - tenant_id
+        - entity_id
+        - process_id
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - status
+        - timestamp

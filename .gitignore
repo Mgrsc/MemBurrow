@@ -1,0 +1,7 @@
+/target
+/.firecrawl
+.env
+/internal_docs
+docker-compose-test.yml
+/tests
+.env.test
