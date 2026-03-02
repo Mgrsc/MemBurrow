@@ -78,7 +78,7 @@ flowchart LR
 - **意图路由** — policy/rule/preference 查询走 SQL 优先；其余走混合检索
 - **Outbox 模式** — event + outbox 单事务写入，精确一次投递
 - **优雅降级** — 向量库不可用时自动降级到 SQL 召回
-- **作用域隔离** — tenant / entity / process 三级隔离
+- **作用域隔离** — tenant / entity / process 三级隔离，内部统一 namespace，并在 SQL + Qdrant 双侧按作用域过滤
 - **审计追踪** — 每条记忆操作完整可追溯
 - **异步写入** — ingest 在 <60 ms 内返回；抽取在后台完成
 

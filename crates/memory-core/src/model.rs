@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub const SHARED_PROCESS_ID: &str = "__shared__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMessage {
     pub role: String,
@@ -101,4 +103,18 @@ pub struct OutboxFeedbackEnvelope {
 
 fn default_top_k() -> usize {
     8
+}
+
+pub fn build_namespace(tenant_id: &str, entity_id: &str, process_id: &str) -> String {
+    format!("{tenant_id}:{entity_id}:{process_id}")
+}
+
+pub fn allowed_namespaces(tenant_id: &str, entity_id: &str, process_id: &str) -> Vec<String> {
+    if process_id == SHARED_PROCESS_ID {
+        return vec![build_namespace(tenant_id, entity_id, process_id)];
+    }
+    vec![
+        build_namespace(tenant_id, entity_id, process_id),
+        build_namespace(tenant_id, entity_id, SHARED_PROCESS_ID),
+    ]
 }

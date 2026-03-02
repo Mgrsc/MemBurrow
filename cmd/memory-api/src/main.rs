@@ -10,8 +10,8 @@ use axum::{
 };
 use memory_core::{
     AuditLogInput, FeedbackRequest, HealthResponse, IngestRequest, LlmUsageInput, RecallRequest,
-    ServiceConfig, append_audit_log, connect_pool, ingest_event, persist_feedback,
-    persist_llm_usage, ping, recall_memories, recall_memories_hybrid,
+    ServiceConfig, allowed_namespaces, append_audit_log, connect_pool, ingest_event,
+    persist_feedback, persist_llm_usage, ping, recall_memories, recall_memories_hybrid,
 };
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
@@ -240,7 +240,13 @@ async fn build_vector_scores(state: &AppState, request: &RecallRequest) -> Vecto
     };
 
     let vector_top_k = request.top_k.max(8) * 4;
-    match state.qdrant.search(&embedding.vector, vector_top_k).await {
+    let namespaces =
+        allowed_namespaces(&request.tenant_id, &request.entity_id, &request.process_id);
+    match state
+        .qdrant
+        .search(&embedding.vector, vector_top_k, &namespaces)
+        .await
+    {
         Ok(rows) => VectorSearchResult {
             scores: rows.into_iter().collect::<HashMap<Uuid, f64>>(),
             usage: embedding.usage,
@@ -445,7 +451,12 @@ impl QdrantSearcher {
         }
     }
 
-    async fn search(&self, vector: &[f32], limit: usize) -> anyhow::Result<Vec<(Uuid, f64)>> {
+    async fn search(
+        &self,
+        vector: &[f32],
+        limit: usize,
+        namespaces: &[String],
+    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
         let url = format!(
             "{}/collections/{}/points/search",
             self.base_url, self.collection
@@ -453,6 +464,16 @@ impl QdrantSearcher {
         let payload = json!({
             "vector": vector,
             "limit": limit,
+            "filter": {
+                "must": [
+                    {
+                        "key": "namespace",
+                        "match": {
+                            "any": namespaces
+                        }
+                    }
+                ]
+            },
             "with_payload": false,
             "with_vector": false
         });

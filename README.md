@@ -78,7 +78,7 @@ flowchart LR
 - **Intent-Based Routing** — policy/rule/preference queries go SQL-first; others go hybrid
 - **Outbox Pattern** — event + outbox written in a single transaction, exactly-once delivery
 - **Graceful Degradation** — vector DB down? recall falls back to SQL-only
-- **Scope Isolation** — tenant / entity / process level isolation
+- **Scope Isolation** — tenant / entity / process isolation with internal namespace unification and SQL+Qdrant scoped filtering
 - **Audit Trail** — full traceability for every memory operation
 - **Async Write Path** — ingest returns in <60 ms; extraction happens in background
 

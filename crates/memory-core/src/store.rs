@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::model::{
     FeedbackRequest, IngestRequest, IngestResponse, OutboxEnvelope, OutboxFeedbackEnvelope,
-    RecallDebug, RecallItem, RecallRequest, RecallResponse,
+    RecallDebug, RecallItem, RecallRequest, RecallResponse, allowed_namespaces, build_namespace,
 };
 
 #[derive(Debug, Error)]
@@ -91,6 +91,7 @@ pub struct ExtractedMemory {
 pub struct EmbeddingRecord {
     pub memory_id: Uuid,
     pub tenant_id: String,
+    pub namespace: String,
     pub model: String,
     pub dims: i32,
     pub embedding: Value,
@@ -102,6 +103,7 @@ pub struct EmbeddingRecord {
 pub struct ReconcileCandidate {
     pub memory_id: Uuid,
     pub tenant_id: String,
+    pub namespace: String,
     pub entity_id: String,
     pub process_id: String,
     pub memory_type: String,
@@ -114,6 +116,7 @@ pub struct ReconcileCandidate {
 struct ReconcileRow {
     memory_id: Uuid,
     tenant_id: String,
+    namespace: String,
     entity_id: String,
     process_id: String,
     memory_type: String,
@@ -360,24 +363,21 @@ async fn fetch_candidates(
     recall_candidate_limit: i64,
     structured_only: bool,
 ) -> Result<Vec<MemoryCandidate>, CoreError> {
-    let scopes = vec![request.process_id.clone(), "__shared__".to_owned()];
+    let namespaces =
+        allowed_namespaces(&request.tenant_id, &request.entity_id, &request.process_id);
     let rows = if structured_only {
         sqlx::query_as::<_, MemoryCandidate>(
             "SELECT id, process_id, memory_type, content, importance, confidence::float8 AS confidence, \
                     last_seen_at, source, properties \
              FROM memory_item \
-             WHERE tenant_id = $1 \
-               AND entity_id = $2 \
-               AND process_id = ANY($3) \
+             WHERE namespace = ANY($1) \
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now()) \
                AND memory_type IN ('preference', 'rule') \
              ORDER BY importance DESC, last_seen_at DESC \
-             LIMIT $4",
+             LIMIT $2",
         )
-        .bind(&request.tenant_id)
-        .bind(&request.entity_id)
-        .bind(&scopes)
+        .bind(&namespaces)
         .bind(recall_candidate_limit)
         .fetch_all(pool)
         .await?
@@ -386,17 +386,13 @@ async fn fetch_candidates(
             "SELECT id, process_id, memory_type, content, importance, confidence::float8 AS confidence, \
                     last_seen_at, source, properties \
              FROM memory_item \
-             WHERE tenant_id = $1 \
-               AND entity_id = $2 \
-               AND process_id = ANY($3) \
+             WHERE namespace = ANY($1) \
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now()) \
              ORDER BY importance DESC, last_seen_at DESC \
-             LIMIT $4",
+             LIMIT $2",
         )
-        .bind(&request.tenant_id)
-        .bind(&request.entity_id)
-        .bind(&scopes)
+        .bind(&namespaces)
         .bind(recall_candidate_limit)
         .fetch_all(pool)
         .await?
@@ -415,23 +411,20 @@ async fn fetch_candidates_by_ids(
         return Ok(Vec::new());
     }
 
-    let scopes = vec![request.process_id.clone(), "__shared__".to_owned()];
+    let namespaces =
+        allowed_namespaces(&request.tenant_id, &request.entity_id, &request.process_id);
     let rows = if structured_only {
         sqlx::query_as::<_, MemoryCandidate>(
             "SELECT id, process_id, memory_type, content, importance, confidence::float8 AS confidence, \
                     last_seen_at, source, properties \
              FROM memory_item \
-             WHERE tenant_id = $1 \
-               AND entity_id = $2 \
-               AND process_id = ANY($3) \
-               AND id = ANY($4) \
+             WHERE namespace = ANY($1) \
+               AND id = ANY($2) \
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now()) \
                AND memory_type IN ('preference', 'rule')",
         )
-        .bind(&request.tenant_id)
-        .bind(&request.entity_id)
-        .bind(&scopes)
+        .bind(&namespaces)
         .bind(ids)
         .fetch_all(pool)
         .await?
@@ -440,16 +433,12 @@ async fn fetch_candidates_by_ids(
             "SELECT id, process_id, memory_type, content, importance, confidence::float8 AS confidence, \
                     last_seen_at, source, properties \
              FROM memory_item \
-             WHERE tenant_id = $1 \
-               AND entity_id = $2 \
-               AND process_id = ANY($3) \
-               AND id = ANY($4) \
+             WHERE namespace = ANY($1) \
+               AND id = ANY($2) \
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now())",
         )
-        .bind(&request.tenant_id)
-        .bind(&request.entity_id)
-        .bind(&scopes)
+        .bind(&namespaces)
         .bind(ids)
         .fetch_all(pool)
         .await?
@@ -612,15 +601,16 @@ pub async fn upsert_memory_item(
     pool: &Pool<Postgres>,
     memory: &ExtractedMemory,
 ) -> Result<Uuid, CoreError> {
+    let namespace = build_namespace(&memory.tenant_id, &memory.entity_id, &memory.process_id);
     let memory_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO memory_item ( \
-            id, tenant_id, entity_id, process_id, session_id, memory_type, category, content, normalized_content, \
+            id, tenant_id, entity_id, process_id, namespace, session_id, memory_type, category, content, normalized_content, \
             importance, confidence, source, status, fingerprint_hash, expires_at, properties \
          ) VALUES ( \
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, \
-            $10, $11, $12, 'active', $13, $14, $15 \
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+            $11, $12, $13, 'active', $14, $15, $16 \
          ) \
-         ON CONFLICT (tenant_id, entity_id, process_id, memory_type, fingerprint_hash) \
+         ON CONFLICT (namespace, memory_type, fingerprint_hash) \
          DO UPDATE SET \
             content = EXCLUDED.content, \
             normalized_content = EXCLUDED.normalized_content, \
@@ -638,6 +628,7 @@ pub async fn upsert_memory_item(
     .bind(&memory.tenant_id)
     .bind(&memory.entity_id)
     .bind(&memory.process_id)
+    .bind(&namespace)
     .bind(&memory.session_id)
     .bind(&memory.memory_type)
     .bind(&memory.category)
@@ -660,10 +651,11 @@ pub async fn persist_embedding(
     record: &EmbeddingRecord,
 ) -> Result<(), CoreError> {
     sqlx::query(
-        "INSERT INTO memory_embedding (memory_id, tenant_id, model, dims, embedding, recall_text, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO memory_embedding (memory_id, tenant_id, namespace, model, dims, embedding, recall_text, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (memory_id) \
          DO UPDATE SET \
+            namespace = EXCLUDED.namespace, \
             model = EXCLUDED.model, \
             dims = EXCLUDED.dims, \
             embedding = EXCLUDED.embedding, \
@@ -673,6 +665,7 @@ pub async fn persist_embedding(
     )
     .bind(record.memory_id)
     .bind(&record.tenant_id)
+    .bind(&record.namespace)
     .bind(&record.model)
     .bind(record.dims)
     .bind(&record.embedding)
@@ -744,7 +737,7 @@ pub async fn list_reconcile_candidates(
     batch_size: i64,
 ) -> Result<Vec<ReconcileCandidate>, CoreError> {
     let rows = sqlx::query_as::<_, ReconcileRow>(
-        "SELECT e.memory_id, e.tenant_id, i.entity_id, i.process_id, i.memory_type, i.source, \
+        "SELECT e.memory_id, e.tenant_id, e.namespace, i.entity_id, i.process_id, i.memory_type, i.source, \
                 e.metadata, e.embedding \
          FROM memory_embedding e \
          JOIN memory_item i ON i.id = e.memory_id \
@@ -762,6 +755,7 @@ pub async fn list_reconcile_candidates(
         parsed.push(ReconcileCandidate {
             memory_id: row.memory_id,
             tenant_id: row.tenant_id,
+            namespace: row.namespace,
             entity_id: row.entity_id,
             process_id: row.process_id,
             memory_type: row.memory_type,

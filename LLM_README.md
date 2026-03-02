@@ -179,6 +179,7 @@ Routing behavior:
 
 - `intent` in `policy/rule/preference/constraint/safety/decision` -> SQL-first.
 - Other intents -> Hybrid (vector + SQL) with SQL fallback if vector search fails.
+- Hybrid vector search is pre-filtered by namespace scope.
 
 Scoring behavior (rerank):
 
@@ -233,11 +234,19 @@ feedback(used_items, helpful, harmful)
 
 ## 6. Isolation, Idempotency, and Consistency
 
-Isolation keys:
+Isolation model:
 
-- `tenant_id`
-- `entity_id`
-- `process_id`
+- External request scope keys:
+  - `tenant_id`
+  - `entity_id`
+  - `process_id`
+- Internal canonical scope key:
+  - `namespace = <tenant_id>:<entity_id>:<process_id>`
+- Recall allowed namespaces:
+  - current process: `<tenant>:<entity>:<process>`
+  - shared process: `<tenant>:<entity>:__shared__`
+- SQL candidate fetch and Qdrant vector search are both filtered by allowed namespaces.
+- If `process_id` is already `__shared__`, recall only uses the shared namespace.
 
 Idempotency:
 

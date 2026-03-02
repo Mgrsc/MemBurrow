@@ -5,7 +5,8 @@ pub mod store;
 pub use config::ServiceConfig;
 pub use model::{
     FeedbackRequest, HealthResponse, IngestRequest, IngestResponse, MemoryMessage, RecallDebug,
-    RecallItem, RecallRequest, RecallResponse,
+    RecallItem, RecallRequest, RecallResponse, SHARED_PROCESS_ID, allowed_namespaces,
+    build_namespace,
 };
 pub use sqlx::{Pool, Postgres};
 pub use store::{

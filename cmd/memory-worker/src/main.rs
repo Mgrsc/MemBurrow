@@ -3,9 +3,10 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use anyhow::{Context, anyhow};
 use memory_core::model::OutboxEnvelope;
 use memory_core::{
-    EmbeddingRecord, ExtractedMemory, IngestRequest, LlmUsageInput, OutboxMessage, ServiceConfig,
-    claim_outbox_batch, connect_pool, list_reconcile_candidates, mark_outbox_done,
-    mark_outbox_retry, persist_embedding, persist_llm_usage, upsert_memory_item,
+    EmbeddingRecord, ExtractedMemory, IngestRequest, LlmUsageInput, OutboxMessage,
+    SHARED_PROCESS_ID, ServiceConfig, build_namespace, claim_outbox_batch, connect_pool,
+    list_reconcile_candidates, mark_outbox_done, mark_outbox_retry, persist_embedding,
+    persist_llm_usage, upsert_memory_item,
 };
 use reqwest::StatusCode;
 use serde_json::{Map, Value, json};
@@ -259,8 +260,10 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
         let memory_id = upsert_memory_item(&state.pool, &memory)
             .await
             .map_err(|error| anyhow!(error))?;
+        let namespace = build_namespace(&memory.tenant_id, &memory.entity_id, &memory.process_id);
 
         let metadata = json!({
+            "namespace": namespace.clone(),
             "tenant_id": memory.tenant_id,
             "entity_id": memory.entity_id,
             "process_id": memory.process_id,
@@ -274,6 +277,7 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
             &EmbeddingRecord {
                 memory_id,
                 tenant_id: memory.tenant_id.clone(),
+                namespace,
                 model: state.config.openai_embedding_model.clone(),
                 dims: state.config.embedding_dims as i32,
                 embedding: json!(vector),
@@ -320,6 +324,10 @@ async fn reconcile_once(state: &WorkerState) -> anyhow::Result<()> {
             .as_object()
             .cloned()
             .unwrap_or_else(Map::new);
+        metadata.insert(
+            "namespace".to_owned(),
+            Value::String(candidate.namespace.clone()),
+        );
         metadata.insert(
             "tenant_id".to_owned(),
             Value::String(candidate.tenant_id.clone()),
@@ -506,7 +514,7 @@ fn parse_extracted_items(
         let process_id = if scope == "process" {
             request.process_id.clone()
         } else {
-            "__shared__".to_owned()
+            SHARED_PROCESS_ID.to_owned()
         };
 
         let fingerprint = format!("{}:{}", memory_type, normalized);
