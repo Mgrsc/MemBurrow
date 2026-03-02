@@ -130,6 +130,9 @@ Behavior:
 
 - Synchronous path writes event + outbox and returns fast.
 - Extraction, embedding, and Qdrant upsert happen asynchronously in worker.
+- `turn_id` should be unique per conversation turn.
+- If `turn_id` is missing, the server uses `no-turn` in idempotency key generation.
+- Reused `event_id` means idempotency hit, so no new outbox task is enqueued.
 
 ### 4.3 Recall
 
@@ -251,6 +254,11 @@ Isolation model:
 Idempotency:
 
 - `ingest`/`feedback` deduplicated via outbox idempotency keys.
+- `ingest` idempotency key format:
+  - `ingest:<tenant_id>:<entity_id>:<process_id>:<turn_id_or_no-turn>`
+- `feedback` idempotency key format:
+  - `feedback:<tenant_id>:<entity_id>:<process_id>:<turn_id_or_no-turn>`
+- Missing `turn_id` causes all requests for same tenant/entity/process to share `no-turn`, often deduplicating later turns unexpectedly.
 - Worker retries with exponential backoff.
 
 Consistency model:
