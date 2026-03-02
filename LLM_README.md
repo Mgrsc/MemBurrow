@@ -26,18 +26,18 @@ Required:
 ```env
 DATABASE_URL=postgres://postgres:postgres@postgres:5432/memburrow
 API_AUTH_TOKEN=dev-token
-QDRANT_URL=http://qdrant:6333
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-xxxx
-OPENAI_EXTRACT_MODEL=gpt-4o-mini
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMS=1536
 ```
 
 Optional:
 
 ```env
 API_BIND_ADDR=0.0.0.0:8080
+QDRANT_URL=http://qdrant:6333
+OPENAI_EXTRACT_MODEL=gpt-4o-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMS=1536
 WORKER_POLL_INTERVAL_MS=1500
 WORKER_BATCH_SIZE=32
 WORKER_MAX_RETRY=8
@@ -58,7 +58,7 @@ Constraints:
 ## 3. Startup
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 Services:
@@ -133,7 +133,7 @@ Behavior:
 - Extraction, embedding, and Qdrant upsert happen asynchronously in worker.
 - `turn_id` should be unique per conversation turn.
 - If `turn_id` is missing, the server uses `no-turn` in idempotency key generation.
-- Reused `event_id` means idempotency hit, so no new outbox task is enqueued.
+- Reusing the same `(tenant_id, entity_id, process_id, turn_id)` hits the same idempotency key and does not enqueue a new outbox task.
 - `context` should include any business metadata needed by your caller; memory service preserves it in raw events.
 - Optional `context.current_time` can be provided by caller as RFC3339 string or Unix timestamp seconds.
 - If `context.current_time` is missing or invalid, worker falls back to server UTC time.

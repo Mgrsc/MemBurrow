@@ -70,12 +70,14 @@ flowchart LR
 
 **评分公式：**
 
-`score = semantic(0.45) + importance(0.18) + confidence(0.14) + freshness(0.13) + scope(0.10)`
+`score = semantic(0.40) + importance(0.16) + confidence(0.12) + freshness(0.22) + scope(0.10)`
+
+`semantic = vector(0.70) + lexical(0.30)`
 
 ## 核心特性
 
-- **5 种记忆类型** — fact、preference、rule、context、event
-- **意图路由** — policy/rule/preference 查询走 SQL 优先；其余走混合检索
+- **5 种记忆类型** — fact、preference、rule、skill、event
+- **意图路由** — policy/rule/preference/constraint/safety/decision 查询走 SQL 优先；其余走混合检索
 - **Outbox 模式** — event + outbox 单事务写入，精确一次投递
 - **优雅降级** — 向量库不可用时自动降级到 SQL 召回
 - **作用域隔离** — tenant / entity / process 三级隔离，内部统一 namespace，并在 SQL + Qdrant 双侧按作用域过滤
@@ -89,7 +91,7 @@ flowchart LR
 ```bash
 git clone https://github.com/Mgrsc/MemBurrow.git && cd MemBurrow
 cp .env.example .env  # 设置 OPENAI_API_KEY
-docker compose up -d --build
+docker compose up -d
 ```
 
 验证：
@@ -180,18 +182,18 @@ MemBurrow/
 |---|---|
 | `DATABASE_URL` | PostgreSQL 连接字符串 |
 | `API_AUTH_TOKEN` | API 认证 Bearer Token |
-| `QDRANT_URL` | Qdrant gRPC/HTTP 端点 |
-| `OPENAI_BASE_URL` | OpenAI 兼容 API 基础 URL（必须以 `/v1` 结尾） |
 | `OPENAI_API_KEY` | LLM 和 Embedding 调用的 API Key |
-| `OPENAI_EXTRACT_MODEL` | 记忆抽取模型（如 `gpt-4o-mini`） |
-| `OPENAI_EMBEDDING_MODEL` | Embedding 模型（如 `text-embedding-3-small`） |
-| `EMBEDDING_DIMS` | Embedding 维度（必须与模型输出一致） |
+| `OPENAI_BASE_URL` | OpenAI 兼容 API 基础 URL（若设置，必须以 `/v1` 结尾） |
 
 **可选**
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API 监听地址 |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP 端点 |
+| `OPENAI_EXTRACT_MODEL` | `gpt-4o-mini` | 记忆抽取模型 |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding 模型 |
+| `EMBEDDING_DIMS` | `1536` | Embedding 维度（必须与模型输出一致） |
 | `WORKER_POLL_INTERVAL_MS` | `1500` | Worker 轮询间隔 |
 | `WORKER_BATCH_SIZE` | `32` | Worker 批量大小 |
 | `WORKER_MAX_RETRY` | `8` | 最大重试次数 |

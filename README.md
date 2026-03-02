@@ -70,12 +70,14 @@ flowchart LR
 
 **Scoring formula:**
 
-`score = semantic(0.45) + importance(0.18) + confidence(0.14) + freshness(0.13) + scope(0.10)`
+`score = semantic(0.40) + importance(0.16) + confidence(0.12) + freshness(0.22) + scope(0.10)`
+
+`semantic = vector(0.70) + lexical(0.30)`
 
 ## Key Features
 
-- **5 Memory Types** — fact, preference, rule, context, event
-- **Intent-Based Routing** — policy/rule/preference queries go SQL-first; others go hybrid
+- **5 Memory Types** — fact, preference, rule, skill, event
+- **Intent-Based Routing** — policy/rule/preference/constraint/safety/decision queries go SQL-first; others go hybrid
 - **Outbox Pattern** — event + outbox written in a single transaction, exactly-once delivery
 - **Graceful Degradation** — vector DB down? recall falls back to SQL-only
 - **Scope Isolation** — tenant / entity / process isolation with internal namespace unification and SQL+Qdrant scoped filtering
@@ -89,7 +91,7 @@ flowchart LR
 ```bash
 git clone https://github.com/Mgrsc/MemBurrow.git && cd MemBurrow
 cp .env.example .env  # set OPENAI_API_KEY
-docker compose up -d --build
+docker compose up -d
 ```
 
 Verify:
@@ -180,18 +182,18 @@ MemBurrow/
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
 | `API_AUTH_TOKEN` | Bearer token for API authentication |
-| `QDRANT_URL` | Qdrant gRPC/HTTP endpoint |
-| `OPENAI_BASE_URL` | OpenAI-compatible API base URL (must end with `/v1`) |
 | `OPENAI_API_KEY` | API key for LLM and embedding calls |
-| `OPENAI_EXTRACT_MODEL` | Model for memory extraction (e.g. `gpt-4o-mini`) |
-| `OPENAI_EMBEDDING_MODEL` | Model for embeddings (e.g. `text-embedding-3-small`) |
-| `EMBEDDING_DIMS` | Embedding dimensions (must match model output) |
+| `OPENAI_BASE_URL` | OpenAI-compatible API base URL (must end with `/v1` if set) |
 
 **Optional**
 
 | Variable | Default | Description |
 |---|---|---|
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP endpoint |
+| `OPENAI_EXTRACT_MODEL` | `gpt-4o-mini` | Model for memory extraction |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Model for embeddings |
+| `EMBEDDING_DIMS` | `1536` | Embedding dimensions (must match model output) |
 | `WORKER_POLL_INTERVAL_MS` | `1500` | Worker poll interval |
 | `WORKER_BATCH_SIZE` | `32` | Worker batch size |
 | `WORKER_MAX_RETRY` | `8` | Max retry attempts |
