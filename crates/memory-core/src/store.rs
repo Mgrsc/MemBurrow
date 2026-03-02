@@ -374,7 +374,7 @@ async fn fetch_candidates(
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now()) \
                AND memory_type IN ('preference', 'rule') \
-             ORDER BY importance DESC, last_seen_at DESC \
+             ORDER BY last_seen_at DESC, importance DESC \
              LIMIT $2",
         )
         .bind(&namespaces)
@@ -389,7 +389,7 @@ async fn fetch_candidates(
              WHERE namespace = ANY($1) \
                AND status = 'active' \
                AND (expires_at IS NULL OR expires_at > now()) \
-             ORDER BY importance DESC, last_seen_at DESC \
+             ORDER BY last_seen_at DESC, importance DESC \
              LIMIT $2",
         )
         .bind(&namespaces)
@@ -479,29 +479,36 @@ fn build_recall_response(
             } else {
                 0.6
             };
-            let score = 0.45 * semantic
-                + 0.18 * importance
-                + 0.14 * confidence
-                + 0.13 * freshness
+            let score = 0.40 * semantic
+                + 0.16 * importance
+                + 0.12 * confidence
+                + 0.22 * freshness
                 + 0.10 * scope_boost;
 
-            Some(RecallItem {
-                id: candidate.id,
-                r#type: candidate.memory_type,
-                content: candidate.content,
-                score,
-                source: candidate.source,
-                properties: candidate.properties,
-            })
+            Some((
+                RecallItem {
+                    id: candidate.id,
+                    r#type: candidate.memory_type,
+                    content: candidate.content,
+                    score,
+                    source: candidate.source,
+                    properties: candidate.properties,
+                },
+                candidate.last_seen_at,
+            ))
         })
         .collect::<Vec<_>>();
 
     ranked.sort_by(|left, right| {
         right
+            .0
             .score
-            .partial_cmp(&left.score)
+            .partial_cmp(&left.0.score)
             .unwrap_or(Ordering::Equal)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.0.id.cmp(&left.0.id))
     });
+    let mut ranked = ranked.into_iter().map(|(item, _)| item).collect::<Vec<_>>();
     ranked.truncate(request.top_k.max(1));
 
     Ok(RecallResponse {

@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use memory_core::model::OutboxEnvelope;
 use memory_core::{
     EmbeddingRecord, ExtractedMemory, IngestRequest, LlmUsageInput, OutboxMessage,
@@ -429,7 +430,9 @@ impl OpenAiExtractor {
 Return a strict JSON object with exactly one top-level key: "items".
 Never return a top-level array.
 Extract only long-term user memory useful for future turns.
-Ignore assistant persona/capabilities/style, skill lists, tool metadata, and runtime fields (tenant_id, entity_id, process_id, current_time).
+Ignore assistant persona/capabilities/style and skill lists.
+Use current_time as temporal reference and resolve relative time expressions (for example: today, tomorrow, recently) into concrete timestamps.
+Do not fabricate clock times. Only output HH:mm or exact timestamps when user explicitly states clock time.
 If no durable user memory exists, return {"items":[]}.
 Each item must include:
 - memory_type: fact|preference|rule|skill|event
@@ -437,12 +440,44 @@ Each item must include:
 - confidence: number in [0,1]
 - importance: integer in [0,100]
 - scope: shared|process
-- properties: object"#;
+- properties: object
+Optional field:
+- expires_at: RFC3339 timestamp for time-bounded memories, especially event memories
+For event memories that contain relative time semantics, always emit absolute time metadata in structured fields:
+- expires_at (preferred), or
+- properties.event_end_at (RFC3339), or
+- properties.event_date (YYYY-MM-DD), or
+- properties.ttl_hours / properties.ttl_days (positive integer)
+For event memory properties, include:
+- time_precision: exact|range|coarse
+- time_window: morning|afternoon|evening|night|unknown
+When only day-level or day-part information is available, set time_precision=coarse and avoid exact timestamps."#;
+        let (resolved_current_time, current_time_source, invalid_current_time) =
+            resolve_extraction_current_time(request);
+        if let Some(provided_current_time) = invalid_current_time {
+            warn!(
+                tenant_id = %request.tenant_id,
+                entity_id = %request.entity_id,
+                process_id = %request.process_id,
+                provided_current_time = %provided_current_time,
+                "invalid context.current_time, fallback to server time"
+            );
+        }
+        let current_time = resolved_current_time.to_rfc3339();
+        info!(
+            tenant_id = %request.tenant_id,
+            entity_id = %request.entity_id,
+            process_id = %request.process_id,
+            current_time = %current_time,
+            current_time_source,
+            "resolved extraction current_time"
+        );
         let user_prompt = format!(
-            "tenant_id={}\nentity_id={}\nprocess_id={}\nmessages=\n{}",
+            "tenant_id={}\nentity_id={}\nprocess_id={}\ncurrent_time={}\nmessages=\n{}",
             request.tenant_id,
             request.entity_id,
             request.process_id,
+            current_time,
             format_messages(request)
         );
 
@@ -547,6 +582,7 @@ fn parse_extracted_items(
 
     let mut dedup = HashSet::new();
     let mut memories = Vec::new();
+    let extracted_at = Utc::now();
 
     for item in items {
         let Some(content) = item.get("content").and_then(|value| value.as_str()) else {
@@ -591,6 +627,18 @@ fn parse_extracted_items(
             .and_then(|value| value.as_object())
             .cloned()
             .unwrap_or_else(Map::new);
+        let expires_at = resolve_memory_expiry(item, &properties, extracted_at);
+
+        if let Some(expires_at_value) = expires_at {
+            info!(
+                tenant_id = %request.tenant_id,
+                entity_id = %request.entity_id,
+                process_id = %process_id,
+                memory_type = memory_type,
+                expires_at = %expires_at_value.to_rfc3339(),
+                "applied extracted memory expiry"
+            );
+        }
 
         memories.push(ExtractedMemory {
             tenant_id: request.tenant_id.clone(),
@@ -604,7 +652,7 @@ fn parse_extracted_items(
             importance,
             confidence,
             source: "conversation".to_owned(),
-            expires_at: None,
+            expires_at,
             properties: Value::Object(properties),
         });
     }
@@ -676,6 +724,139 @@ fn content_preview(raw: &str) -> String {
         return compact;
     }
     format!("{}...", &compact[..max])
+}
+
+fn resolve_memory_expiry(
+    item: &Value,
+    properties: &Map<String, Value>,
+    extracted_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let event_date = parse_date_end_of_day(item.get("event_date"))
+        .or_else(|| parse_date_end_of_day(properties.get("event_date")));
+    let precision = parse_time_precision(item, properties);
+
+    if precision != TimePrecision::Exact && event_date.is_some() {
+        return event_date;
+    }
+
+    parse_datetime_value(item.get("expires_at"))
+        .or_else(|| parse_datetime_value(properties.get("expires_at")))
+        .or_else(|| parse_datetime_value(item.get("event_end_at")))
+        .or_else(|| parse_datetime_value(properties.get("event_end_at")))
+        .or(event_date)
+        .or_else(|| parse_ttl_expiry(item, properties, extracted_at))
+}
+
+fn parse_ttl_expiry(
+    item: &Value,
+    properties: &Map<String, Value>,
+    extracted_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if let Some(hours) = parse_positive_i64(item.get("ttl_hours"))
+        .or_else(|| parse_positive_i64(properties.get("ttl_hours")))
+        .or_else(|| parse_positive_i64(properties.get("relative_hours")))
+        && hours > 0
+    {
+        return Some(extracted_at + ChronoDuration::hours(hours));
+    }
+    if let Some(days) = parse_positive_i64(item.get("ttl_days"))
+        .or_else(|| parse_positive_i64(properties.get("ttl_days")))
+        .or_else(|| parse_positive_i64(properties.get("relative_days")))
+        && days > 0
+    {
+        return Some(extracted_at + ChronoDuration::days(days));
+    }
+    None
+}
+
+fn end_of_day_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
+    let datetime = date.and_hms_opt(23, 59, 59)?;
+    Some(DateTime::from_naive_utc_and_offset(datetime, Utc))
+}
+
+fn parse_date_end_of_day(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    let text = value.and_then(|item| item.as_str())?;
+    let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    end_of_day_utc(date)
+}
+
+fn parse_datetime_value(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    let text = value.and_then(|item| item.as_str())?;
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimePrecision {
+    Exact,
+    Range,
+    Coarse,
+    Unknown,
+}
+
+fn parse_time_precision(item: &Value, properties: &Map<String, Value>) -> TimePrecision {
+    let value = item
+        .get("time_precision")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            properties
+                .get("time_precision")
+                .and_then(|value| value.as_str())
+        })
+        .map(|value| value.trim().to_lowercase());
+
+    match value.as_deref() {
+        Some("exact") => TimePrecision::Exact,
+        Some("range") => TimePrecision::Range,
+        Some("coarse") => TimePrecision::Coarse,
+        _ => TimePrecision::Unknown,
+    }
+}
+
+fn resolve_extraction_current_time(
+    request: &IngestRequest,
+) -> (DateTime<Utc>, &'static str, Option<String>) {
+    let maybe_current_time = request.context.get("current_time");
+    let Some(raw_current_time) = maybe_current_time else {
+        return (Utc::now(), "server", None);
+    };
+
+    if let Some(parsed) = parse_datetime_value(Some(raw_current_time))
+        .or_else(|| parse_unix_timestamp(raw_current_time))
+    {
+        return (parsed, "caller", None);
+    }
+
+    (Utc::now(), "server", Some(value_preview(raw_current_time)))
+}
+
+fn parse_unix_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    let seconds = match value {
+        Value::Number(number) => number.as_i64()?,
+        Value::String(text) => text.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    DateTime::from_timestamp(seconds, 0)
+}
+
+fn value_preview(value: &Value) -> String {
+    let raw = value.to_string();
+    let max = 120;
+    if raw.len() <= max {
+        return raw;
+    }
+    format!("{}...", &raw[..max])
+}
+
+fn parse_positive_i64(value: Option<&Value>) -> Option<i64> {
+    let raw = value?;
+    let parsed = match raw {
+        Value::Number(number) => number.as_i64()?,
+        Value::String(text) => text.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    if parsed > 0 { Some(parsed) } else { None }
 }
 
 #[derive(Clone)]

@@ -110,6 +110,7 @@ Request:
     {"role": "assistant", "content": "Noted."}
   ],
   "context": {
+    "current_time": "2026-03-02T05:58:47Z",
     "channel": "web",
     "language": "en-US"
   }
@@ -133,6 +134,9 @@ Behavior:
 - `turn_id` should be unique per conversation turn.
 - If `turn_id` is missing, the server uses `no-turn` in idempotency key generation.
 - Reused `event_id` means idempotency hit, so no new outbox task is enqueued.
+- `context` should include any business metadata needed by your caller; memory service preserves it in raw events.
+- Optional `context.current_time` can be provided by caller as RFC3339 string or Unix timestamp seconds.
+- If `context.current_time` is missing or invalid, worker falls back to server UTC time.
 
 ### 4.3 Recall
 
@@ -188,6 +192,19 @@ Scoring behavior (rerank):
 
 - semantic + lexical + importance + confidence + freshness + scope.
 
+Score filtering responsibility:
+
+- Server-side recall already applies baseline filtering and ranking:
+  - expired memories are excluded
+  - very low confidence memories are dropped
+  - results are sorted by score and recency, then truncated by `top_k`
+- Client-side score threshold is optional and business-dependent:
+  - if you need stricter precision, apply a second filter on returned `items[].score`
+  - recommended starting thresholds:
+    - high-precision critical prompts: `score >= 0.70`
+    - general assistant prompts: `score >= 0.55`
+  - if all items are filtered out, fallback to empty memory context rather than forcing low-score items.
+
 ### 4.4 Feedback
 
 - `POST /v1/memory/feedback`
@@ -206,6 +223,44 @@ Request:
   "note": "Matched preference and improved recommendation quality."
 }
 ```
+
+### 4.5 Extraction Output Contract (for model providers)
+
+If you implement or proxy the extraction model call, the returned JSON content must follow:
+
+```json
+{
+  "items": [
+    {
+      "memory_type": "fact|preference|rule|skill|event",
+      "content": "string",
+      "confidence": 0.0,
+      "importance": 0,
+      "scope": "shared|process",
+      "properties": {},
+      "expires_at": "2026-03-02T23:59:59Z"
+    }
+  ]
+}
+```
+
+Rules:
+
+- Top-level must be an object with key `items`.
+- Never return top-level array as final output.
+- Temporal normalization should use the `current_time` value provided in extraction prompt.
+- For time-bounded event memories, return absolute temporal fields (use any one or more):
+  - `expires_at` (RFC3339, preferred)
+  - `properties.event_end_at` (RFC3339)
+  - `properties.event_date` (`YYYY-MM-DD`)
+  - `properties.ttl_hours` / `properties.ttl_days` (positive integer)
+- For event memories, also include temporal granularity fields in `properties`:
+  - `time_precision`: `exact|range|coarse`
+  - `time_window`: `morning|afternoon|evening|night|unknown`
+- Do not fabricate exact clock time:
+  - only output exact `HH:mm` or exact timestamp when user explicitly states a clock time
+  - if user only states day/day-part (for example "tomorrow afternoon"), prefer `event_date` + `time_window` + `time_precision=coarse`
+- Do not return unresolved relative-time-only metadata for event expiry decisions.
 
 Response:
 
@@ -286,6 +341,7 @@ For temporary low recall after ingest:
 
 - No local embedding model support at this time.
 - Extraction quality depends on upstream LLM response quality.
+- Temporal expiry quality depends on structured absolute time fields from extraction output.
 - Immediate read-after-write completeness is not guaranteed due to async processing.
 
 ## 9. Quick API Examples
