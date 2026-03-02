@@ -101,7 +101,9 @@ async fn run_once(state: &WorkerState) -> anyhow::Result<()> {
         if let Err(error) = process_message(state, &message).await {
             warn!(
                 outbox_id = %message.id,
+                event_type = %message.event_type,
                 retry_count = message.retry_count,
+                max_retry = state.config.worker_max_retry,
                 error = %error,
                 "processing outbox message failed"
             );
@@ -148,7 +150,19 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
     let envelope: OutboxEnvelope = serde_json::from_value(message.payload.clone())
         .context("failed to decode outbox payload")?;
 
-    let extraction = state.extractor.extract(&envelope.request).await?;
+    let extraction = state
+        .extractor
+        .extract(&envelope.request)
+        .await
+        .with_context(|| {
+            format!(
+                "extract failed: outbox_id={}, tenant_id={}, entity_id={}, process_id={}",
+                message.id,
+                envelope.request.tenant_id.as_str(),
+                envelope.request.entity_id.as_str(),
+                envelope.request.process_id.as_str()
+            )
+        })?;
     if let Some(usage) = extraction.usage {
         info!(
             outbox_id = %message.id,
@@ -411,7 +425,19 @@ impl OpenAiExtractor {
 
     async fn extract(&self, request: &IngestRequest) -> anyhow::Result<ExtractionResult> {
         let url = format!("{}/chat/completions", self.base_url);
-        let system_prompt = "You extract durable user memory from conversation. Return strict JSON object with key items. Each item fields: memory_type (fact|preference|rule|skill|event), content, confidence (0-1), importance (0-100), scope (shared|process), properties (object).";
+        let system_prompt = r#"You extract durable USER memory from conversation.
+Return a strict JSON object with exactly one top-level key: "items".
+Never return a top-level array.
+Extract only long-term user memory useful for future turns.
+Ignore assistant persona/capabilities/style, skill lists, tool metadata, and runtime fields (tenant_id, entity_id, process_id, current_time).
+If no durable user memory exists, return {"items":[]}.
+Each item must include:
+- memory_type: fact|preference|rule|skill|event
+- content: string
+- confidence: number in [0,1]
+- importance: integer in [0,100]
+- scope: shared|process
+- properties: object"#;
         let user_prompt = format!(
             "tenant_id={}\nentity_id={}\nprocess_id={}\nmessages=\n{}",
             request.tenant_id,
@@ -486,12 +512,38 @@ fn parse_extracted_items(
 ) -> anyhow::Result<Vec<ExtractedMemory>> {
     let parsed = serde_json::from_str::<Value>(content)
         .or_else(|_| serde_json::from_str::<Value>(&extract_json_fragment(content)))
-        .map_err(|error| anyhow!("failed to parse extraction JSON: {}", error))?;
+        .map_err(|error| {
+            anyhow!(
+                "failed to parse extraction JSON: {}; content_preview={}",
+                error,
+                content_preview(content)
+            )
+        })?;
 
-    let items = parsed
-        .get("items")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow!("extraction result missing items array"))?;
+    let items = if let Some(object) = parsed.as_object() {
+        object.get("items").and_then(|value| value.as_array()).ok_or_else(|| {
+            anyhow!(
+                "extraction result missing items array: top_level=object keys={} content_preview={}",
+                object_keys(object),
+                content_preview(content)
+            )
+        })?
+    } else if let Some(array) = parsed.as_array() {
+        warn!(
+            tenant_id = %request.tenant_id,
+            entity_id = %request.entity_id,
+            process_id = %request.process_id,
+            item_count = array.len(),
+            "extraction returned top-level array; auto-wrapping as items"
+        );
+        array
+    } else {
+        return Err(anyhow!(
+            "extraction result invalid top-level type: top_level={} content_preview={}",
+            json_type_name(&parsed),
+            content_preview(content)
+        ));
+    };
 
     let mut dedup = HashSet::new();
     let mut memories = Vec::new();
@@ -594,6 +646,36 @@ fn normalize_content(content: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn object_keys(object: &Map<String, Value>) -> String {
+    if object.is_empty() {
+        return "[]".to_owned();
+    }
+
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    format!("[{}]", keys.join(","))
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn content_preview(raw: &str) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max = 240;
+    if compact.len() <= max {
+        return compact;
+    }
+    format!("{}...", &compact[..max])
 }
 
 #[derive(Clone)]
