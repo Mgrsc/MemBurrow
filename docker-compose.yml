@@ -28,13 +28,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command:
-      - /bin/sh
-      - -ec
-      - |
-        memory-migrator
-        memory-worker &
-        exec memory-api
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 5s
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/memburrow
       API_BIND_ADDR: 0.0.0.0:8080
