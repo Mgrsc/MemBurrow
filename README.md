@@ -90,8 +90,15 @@ flowchart LR
 
 ```bash
 git clone https://github.com/Mgrsc/MemBurrow.git && cd MemBurrow
-cp .env.example .env  # set OPENAI_API_KEY
+cp .env.lite.example .env  # lite profile by default, set OPENAI_API_KEY
 docker compose up -d
+```
+
+Distributed profile:
+
+```bash
+cp .env.distributed.example .env
+docker compose --profile distributed up -d
 ```
 
 Verify:
@@ -148,8 +155,8 @@ curl -s -X POST http://localhost:8080/v1/memory/recall \
 |---|---|
 | Language | Rust |
 | HTTP framework | Axum |
-| Database | PostgreSQL + SQLx |
-| Vector index | Qdrant |
+| Database | SQLite (lite) / PostgreSQL (distributed) + SQLx |
+| Vector index | sqlite-vector (lite) / Qdrant (distributed) |
 | LLM / Embedding | OpenAI-compatible API |
 | Deployment | Docker Compose |
 
@@ -166,9 +173,11 @@ MemBurrow/
 ├── crates/
 │   └── memory-core/         # Shared domain logic, models, store
 ├── migrations/              # SQL migration files
+├── migrations_sqlite/       # SQLite migration files
 ├── docker-compose.yml
 ├── Dockerfile
-└── .env.example
+├── .env.lite.example
+└── .env.distributed.example
 ```
 
 ## Configuration
@@ -180,7 +189,7 @@ MemBurrow/
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
+| `BACKEND_PROFILE` | `lite` or `distributed` |
 | `API_AUTH_TOKEN` | Bearer token for API authentication |
 | `OPENAI_API_KEY` | API key for LLM and embedding calls |
 | `OPENAI_BASE_URL` | OpenAI-compatible API base URL (must end with `/v1` if set) |
@@ -189,8 +198,12 @@ MemBurrow/
 
 | Variable | Default | Description |
 |---|---|---|
+| `SQLITE_DATABASE_URL` | `sqlite://./data/memburrow.db` | SQLite database URL (lite profile) |
+| `SQLITE_VECTOR_EXTENSION_PATH` | `/usr/local/lib/sqlite-vector/vector.so` | sqlite-vector extension path (lite profile) |
+| `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout in milliseconds |
+| `DATABASE_URL` | `` | PostgreSQL connection string (distributed profile) |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP endpoint (distributed profile) |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address |
-| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP endpoint |
 | `OPENAI_EXTRACT_MODEL` | `gpt-4o-mini` | Model for memory extraction |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Model for embeddings |
 | `EMBEDDING_DIMS` | `1536` | Embedding dimensions (must match model output) |

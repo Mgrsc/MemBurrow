@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:18.3-alpine3.23
+    profiles: ["distributed"]
     environment:
       POSTGRES_DB: memburrow
       POSTGRES_USER: postgres
@@ -17,6 +18,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
+    profiles: ["distributed"]
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -30,11 +32,8 @@ services:
     stop_grace_period: 5s
     env_file:
       - .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
+    volumes:
+      - ./data:/app/data
     ports:
       - "8080:8080"
 

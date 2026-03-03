@@ -5,3 +5,4 @@
 docker-compose.test.yml
 /tests
 .env.test
+/data

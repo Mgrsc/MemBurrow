@@ -14,8 +14,12 @@ Core responsibilities:
 
 Current implementation:
 
-- Structured memory source of truth: PostgreSQL
-- Vector index: Qdrant
+- Structured memory source of truth:
+  - lite profile: SQLite
+  - distributed profile: PostgreSQL
+- Vector index:
+  - lite profile: sqlite-vector
+  - distributed profile: Qdrant
 - Embeddings API: OpenAI-compatible `/v1/embeddings`
 - Extraction model: OpenAI-compatible chat completion endpoint
 
@@ -24,7 +28,7 @@ Current implementation:
 Required:
 
 ```env
-DATABASE_URL=postgres://postgres:postgres@postgres:5432/memburrow
+BACKEND_PROFILE=lite
 API_AUTH_TOKEN=dev-token
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=sk-xxxx
@@ -34,6 +38,10 @@ Optional:
 
 ```env
 API_BIND_ADDR=0.0.0.0:8080
+SQLITE_DATABASE_URL=sqlite://./data/memburrow.db
+SQLITE_VECTOR_EXTENSION_PATH=/usr/local/lib/sqlite-vector/vector.so
+SQLITE_BUSY_TIMEOUT_MS=5000
+DATABASE_URL=postgres://postgres:postgres@postgres:5432/memburrow
 QDRANT_URL=http://qdrant:6333
 OPENAI_EXTRACT_MODEL=gpt-4o-mini
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
@@ -53,7 +61,7 @@ Constraints:
 
 - `OPENAI_BASE_URL` must end with `/v1`.
 - `EMBEDDING_DIMS` must match real model output dimensions.
-- Qdrant collection name is fixed to `memburrow_agent_memory`.
+- In `distributed` profile, Qdrant collection name is fixed to `memburrow_agent_memory`.
 
 ## 3. Startup
 
@@ -61,11 +69,18 @@ Constraints:
 docker compose up -d
 ```
 
+Distributed profile:
+
+```bash
+cp .env.distributed.example .env
+docker compose --profile distributed up -d
+```
+
 Services:
 
-- `postgres`
-- `qdrant`
 - `memory-service` (migrator -> worker + api)
+- `postgres` (distributed profile)
+- `qdrant` (distributed profile)
 
 ## 4. API Summary
 
@@ -130,7 +145,7 @@ Response:
 Behavior:
 
 - Synchronous path writes event + outbox and returns fast.
-- Extraction, embedding, and Qdrant upsert happen asynchronously in worker.
+- Extraction and embedding persist happen asynchronously in worker.
 - `turn_id` should be unique per conversation turn.
 - If `turn_id` is missing, the server uses `no-turn` in idempotency key generation.
 - Reusing the same `(tenant_id, entity_id, process_id, turn_id)` hits the same idempotency key and does not enqueue a new outbox task.

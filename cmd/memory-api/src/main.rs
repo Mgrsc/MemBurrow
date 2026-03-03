@@ -10,19 +10,32 @@ use axum::{
 };
 use memory_core::{
     AuditLogInput, FeedbackRequest, HealthResponse, IngestRequest, LlmUsageInput, RecallRequest,
-    ServiceConfig, allowed_namespaces, append_audit_log, connect_pool, ingest_event,
-    persist_feedback, persist_llm_usage, ping, recall_memories, recall_memories_hybrid,
+    ServiceConfig, allowed_namespaces, append_audit_log, append_audit_log_sqlite, connect_pool,
+    connect_sqlite_pool, ingest_event, ingest_event_sqlite, init_sqlite_vector_store,
+    persist_feedback, persist_feedback_sqlite, persist_llm_usage, persist_llm_usage_sqlite, ping,
+    ping_sqlite, recall_memories, recall_memories_hybrid, recall_memories_hybrid_sqlite,
+    recall_memories_sqlite, search_vector_scores_sqlite,
 };
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
+enum AppBackend {
+    Distributed {
+        pool: memory_core::Pool<memory_core::Postgres>,
+        qdrant: QdrantSearcher,
+    },
+    Lite {
+        pool: memory_core::Pool<memory_core::Sqlite>,
+    },
+}
+
+#[derive(Clone)]
 struct AppState {
-    pool: memory_core::Pool<memory_core::Postgres>,
+    backend: AppBackend,
     config: Arc<ServiceConfig>,
     embedder: OpenAiEmbedder,
-    qdrant: QdrantSearcher,
 }
 
 #[tokio::main]
@@ -30,15 +43,28 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env().context("failed to load configuration")?;
     init_tracing(&config.log_format);
 
-    let pool = connect_pool(&config.database_url)
-        .await
-        .context("failed to connect database")?;
+    let backend = if config.is_lite() {
+        let pool = connect_sqlite_pool(&config)
+            .await
+            .context("failed to connect sqlite database")?;
+        init_sqlite_vector_store(&pool, config.embedding_dims)
+            .await
+            .context("failed to initialize sqlite vector store")?;
+        AppBackend::Lite { pool }
+    } else {
+        let pool = connect_pool(&config.database_url)
+            .await
+            .context("failed to connect postgres database")?;
+        AppBackend::Distributed {
+            pool,
+            qdrant: QdrantSearcher::new(&config),
+        }
+    };
 
     let state = AppState {
-        pool,
+        backend,
         config: Arc::new(config.clone()),
         embedder: OpenAiEmbedder::new(&config),
-        qdrant: QdrantSearcher::new(&config),
     };
 
     let app = Router::new()
@@ -81,26 +107,28 @@ async fn ingest_handler(
         "ingest request received"
     );
 
-    let response = ingest_event(&state.pool, &request)
-        .await
-        .map_err(ApiError::from)?;
-    append_audit_log(
-        &state.pool,
-        &AuditLogInput {
-            tenant_id: request.tenant_id.clone(),
-            entity_id: request.entity_id.clone(),
-            process_id: request.process_id.clone(),
-            request_id: auth.request_id,
-            actor: auth.actor,
-            action: "ingest.accepted".to_owned(),
-            payload: json!({
-                "event_id": response.event_id.clone(),
-                "task_id": response.task_id.clone(),
-                "message_count": request.messages.len(),
-            }),
-        },
-    )
-    .await
+    let response = match &state.backend {
+        AppBackend::Distributed { pool, .. } => ingest_event(pool, &request).await,
+        AppBackend::Lite { pool } => ingest_event_sqlite(pool, &request).await,
+    }
+    .map_err(ApiError::from)?;
+    let audit_input = AuditLogInput {
+        tenant_id: request.tenant_id.clone(),
+        entity_id: request.entity_id.clone(),
+        process_id: request.process_id.clone(),
+        request_id: auth.request_id,
+        actor: auth.actor,
+        action: "ingest.accepted".to_owned(),
+        payload: json!({
+            "event_id": response.event_id.clone(),
+            "task_id": response.task_id.clone(),
+            "message_count": request.messages.len(),
+        }),
+    };
+    match &state.backend {
+        AppBackend::Distributed { pool, .. } => append_audit_log(pool, &audit_input).await,
+        AppBackend::Lite { pool } => append_audit_log_sqlite(pool, &audit_input).await,
+    }
     .map_err(ApiError::from)?;
 
     info!(
@@ -144,73 +172,99 @@ async fn recall_handler(
             total_tokens = usage.total_tokens,
             "recorded recall embedding token usage"
         );
-        if let Err(error) = persist_llm_usage(
-            &state.pool,
-            &LlmUsageInput {
-                tenant_id: request.tenant_id.clone(),
-                entity_id: request.entity_id.clone(),
-                process_id: request.process_id.clone(),
-                event_type: "recall".to_owned(),
-                event_id: auth.request_id.clone(),
-                operation: "embed_query".to_owned(),
-                provider: "openai-compatible".to_owned(),
-                model: vector_result
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| state.config.openai_embedding_model.clone()),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                payload: json!({
-                    "query": request.query.clone(),
-                    "intent": request.intent.clone()
-                }),
-            },
-        )
-        .await
-        {
+        let usage_input = LlmUsageInput {
+            tenant_id: request.tenant_id.clone(),
+            entity_id: request.entity_id.clone(),
+            process_id: request.process_id.clone(),
+            event_type: "recall".to_owned(),
+            event_id: auth.request_id.clone(),
+            operation: "embed_query".to_owned(),
+            provider: "openai-compatible".to_owned(),
+            model: vector_result
+                .model
+                .clone()
+                .unwrap_or_else(|| state.config.openai_embedding_model.clone()),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            payload: json!({
+                "query": request.query.clone(),
+                "intent": request.intent.clone()
+            }),
+        };
+        let usage_result = match &state.backend {
+            AppBackend::Distributed { pool, .. } => persist_llm_usage(pool, &usage_input).await,
+            AppBackend::Lite { pool } => persist_llm_usage_sqlite(pool, &usage_input).await,
+        };
+        if let Err(error) = usage_result {
             warn!(error = %error, "failed to persist recall embedding usage");
         }
     }
     let response = if route == RecallRoute::SqlFirst {
-        recall_memories(&state.pool, &request, state.config.recall_candidate_limit)
-            .await
-            .map_err(ApiError::from)?
+        match &state.backend {
+            AppBackend::Distributed { pool, .. } => {
+                recall_memories(pool, &request, state.config.recall_candidate_limit).await
+            }
+            AppBackend::Lite { pool } => {
+                recall_memories_sqlite(pool, &request, state.config.recall_candidate_limit).await
+            }
+        }
+        .map_err(ApiError::from)?
     } else {
         let vector_scores: HashMap<Uuid, f64> = vector_result.scores;
         if vector_scores.is_empty() {
-            recall_memories(&state.pool, &request, state.config.recall_candidate_limit)
-                .await
-                .map_err(ApiError::from)?
+            match &state.backend {
+                AppBackend::Distributed { pool, .. } => {
+                    recall_memories(pool, &request, state.config.recall_candidate_limit).await
+                }
+                AppBackend::Lite { pool } => {
+                    recall_memories_sqlite(pool, &request, state.config.recall_candidate_limit)
+                        .await
+                }
+            }
+            .map_err(ApiError::from)?
         } else {
-            recall_memories_hybrid(
-                &state.pool,
-                &request,
-                state.config.recall_candidate_limit,
-                vector_scores,
-            )
-            .await
+            match &state.backend {
+                AppBackend::Distributed { pool, .. } => {
+                    recall_memories_hybrid(
+                        pool,
+                        &request,
+                        state.config.recall_candidate_limit,
+                        vector_scores,
+                    )
+                    .await
+                }
+                AppBackend::Lite { pool } => {
+                    recall_memories_hybrid_sqlite(
+                        pool,
+                        &request,
+                        state.config.recall_candidate_limit,
+                        vector_scores,
+                    )
+                    .await
+                }
+            }
             .map_err(ApiError::from)?
         }
     };
-    append_audit_log(
-        &state.pool,
-        &AuditLogInput {
-            tenant_id: request.tenant_id.clone(),
-            entity_id: request.entity_id.clone(),
-            process_id: request.process_id.clone(),
-            request_id: auth.request_id,
-            actor: auth.actor,
-            action: "recall.completed".to_owned(),
-            payload: json!({
-                "query": request.query.clone(),
-                "intent": request.intent.clone(),
-                "route": response.debug.route.clone(),
-                "returned": response.items.len(),
-            }),
-        },
-    )
-    .await
+    let audit_input = AuditLogInput {
+        tenant_id: request.tenant_id.clone(),
+        entity_id: request.entity_id.clone(),
+        process_id: request.process_id.clone(),
+        request_id: auth.request_id,
+        actor: auth.actor,
+        action: "recall.completed".to_owned(),
+        payload: json!({
+            "query": request.query.clone(),
+            "intent": request.intent.clone(),
+            "route": response.debug.route.clone(),
+            "returned": response.items.len(),
+        }),
+    };
+    match &state.backend {
+        AppBackend::Distributed { pool, .. } => append_audit_log(pool, &audit_input).await,
+        AppBackend::Lite { pool } => append_audit_log_sqlite(pool, &audit_input).await,
+    }
     .map_err(ApiError::from)?;
 
     info!(
@@ -242,18 +296,25 @@ async fn build_vector_scores(state: &AppState, request: &RecallRequest) -> Vecto
     let vector_top_k = request.top_k.max(8) * 4;
     let namespaces =
         allowed_namespaces(&request.tenant_id, &request.entity_id, &request.process_id);
-    match state
-        .qdrant
-        .search(&embedding.vector, vector_top_k, &namespaces)
-        .await
-    {
+    let search_result = match &state.backend {
+        AppBackend::Distributed { qdrant, .. } => qdrant
+            .search(&embedding.vector, vector_top_k, &namespaces)
+            .await
+            .map_err(|error| anyhow::anyhow!("qdrant search failed: {error}")),
+        AppBackend::Lite { pool } => {
+            search_vector_scores_sqlite(pool, &embedding.vector, vector_top_k, &namespaces)
+                .await
+                .map_err(|error| anyhow::anyhow!("sqlite vector search failed: {error}"))
+        }
+    };
+    match search_result {
         Ok(rows) => VectorSearchResult {
             scores: rows.into_iter().collect::<HashMap<Uuid, f64>>(),
             usage: embedding.usage,
             model: embedding.model,
         },
         Err(error) => {
-            warn!(error = %error, "qdrant search failed, fallback to sql-first");
+            warn!(error = %error, "vector search failed, fallback to sql-first");
             VectorSearchResult {
                 scores: HashMap::new(),
                 usage: embedding.usage,
@@ -281,35 +342,41 @@ async fn feedback_handler(
         "feedback request received"
     );
 
-    let response = persist_feedback(&state.pool, &request)
-        .await
-        .map_err(ApiError::from)?;
-    append_audit_log(
-        &state.pool,
-        &AuditLogInput {
-            tenant_id: request.tenant_id.clone(),
-            entity_id: request.entity_id.clone(),
-            process_id: request.process_id.clone(),
-            request_id: auth.request_id,
-            actor: auth.actor,
-            action: "feedback.accepted".to_owned(),
-            payload: json!({
-                "event_id": response.event_id.clone(),
-                "task_id": response.task_id.clone(),
-                "used_count": request.used_items.len(),
-                "helpful_count": request.helpful.len(),
-                "harmful_count": request.harmful.len(),
-            }),
-        },
-    )
-    .await
+    let response = match &state.backend {
+        AppBackend::Distributed { pool, .. } => persist_feedback(pool, &request).await,
+        AppBackend::Lite { pool } => persist_feedback_sqlite(pool, &request).await,
+    }
+    .map_err(ApiError::from)?;
+    let audit_input = AuditLogInput {
+        tenant_id: request.tenant_id.clone(),
+        entity_id: request.entity_id.clone(),
+        process_id: request.process_id.clone(),
+        request_id: auth.request_id,
+        actor: auth.actor,
+        action: "feedback.accepted".to_owned(),
+        payload: json!({
+            "event_id": response.event_id.clone(),
+            "task_id": response.task_id.clone(),
+            "used_count": request.used_items.len(),
+            "helpful_count": request.helpful.len(),
+            "harmful_count": request.harmful.len(),
+        }),
+    };
+    match &state.backend {
+        AppBackend::Distributed { pool, .. } => append_audit_log(pool, &audit_input).await,
+        AppBackend::Lite { pool } => append_audit_log_sqlite(pool, &audit_input).await,
+    }
     .map_err(ApiError::from)?;
 
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    ping(&state.pool).await.map_err(ApiError::from)?;
+    match &state.backend {
+        AppBackend::Distributed { pool, .. } => ping(pool).await,
+        AppBackend::Lite { pool } => ping_sqlite(pool).await,
+    }
+    .map_err(ApiError::from)?;
 
     Ok(Json(HealthResponse {
         status: "ok".to_owned(),

@@ -5,21 +5,33 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use memory_core::model::OutboxEnvelope;
 use memory_core::{
     EmbeddingRecord, ExtractedMemory, IngestRequest, LlmUsageInput, OutboxMessage,
-    SHARED_PROCESS_ID, ServiceConfig, build_namespace, claim_outbox_batch, connect_pool,
-    list_reconcile_candidates, mark_outbox_done, mark_outbox_retry, persist_embedding,
-    persist_llm_usage, upsert_memory_item,
+    SHARED_PROCESS_ID, ServiceConfig, build_namespace, claim_outbox_batch,
+    claim_outbox_batch_sqlite, connect_pool, connect_sqlite_pool, init_sqlite_vector_store,
+    list_reconcile_candidates, mark_outbox_done, mark_outbox_done_sqlite, mark_outbox_retry,
+    mark_outbox_retry_sqlite, persist_embedding, persist_embedding_sqlite, persist_llm_usage,
+    persist_llm_usage_sqlite, upsert_memory_item, upsert_memory_item_sqlite,
 };
 use reqwest::StatusCode;
 use serde_json::{Map, Value, json};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
+enum WorkerBackend {
+    Distributed {
+        pool: memory_core::Pool<memory_core::Postgres>,
+        qdrant: Qdrant,
+    },
+    Lite {
+        pool: memory_core::Pool<memory_core::Sqlite>,
+    },
+}
+
+#[derive(Clone)]
 struct WorkerState {
-    pool: memory_core::Pool<memory_core::Postgres>,
+    backend: WorkerBackend,
     config: Arc<ServiceConfig>,
     extractor: OpenAiExtractor,
     embedder: OpenAiEmbedder,
-    qdrant: Qdrant,
 }
 
 #[tokio::main]
@@ -27,21 +39,30 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env().context("failed to load configuration")?;
     init_tracing(&config.log_format);
 
-    let pool = connect_pool(&config.database_url)
-        .await
-        .context("failed to connect database")?;
-
     let extractor = OpenAiExtractor::new(&config);
     let embedder = OpenAiEmbedder::new(&config);
-    let qdrant = Qdrant::new(&config);
-    qdrant.ensure_collection(config.embedding_dims).await?;
+    let backend = if config.is_lite() {
+        let pool = connect_sqlite_pool(&config)
+            .await
+            .context("failed to connect sqlite database")?;
+        init_sqlite_vector_store(&pool, config.embedding_dims)
+            .await
+            .context("failed to initialize sqlite vector store")?;
+        WorkerBackend::Lite { pool }
+    } else {
+        let pool = connect_pool(&config.database_url)
+            .await
+            .context("failed to connect postgres database")?;
+        let qdrant = Qdrant::new(&config);
+        qdrant.ensure_collection(config.embedding_dims).await?;
+        WorkerBackend::Distributed { pool, qdrant }
+    };
 
     let state = WorkerState {
-        pool,
+        backend,
         config: Arc::new(config.clone()),
         extractor,
         embedder,
-        qdrant,
     };
 
     let mut ticker = tokio::time::interval(Duration::from_millis(config.worker_poll_interval_ms));
@@ -88,9 +109,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_once(state: &WorkerState) -> anyhow::Result<()> {
-    let batch = claim_outbox_batch(&state.pool, state.config.worker_batch_size)
-        .await
-        .map_err(|error| anyhow!(error))?;
+    let batch = match &state.backend {
+        WorkerBackend::Distributed { pool, .. } => {
+            claim_outbox_batch(pool, state.config.worker_batch_size).await
+        }
+        WorkerBackend::Lite { pool } => {
+            claim_outbox_batch_sqlite(pool, state.config.worker_batch_size).await
+        }
+    }
+    .map_err(|error| anyhow!(error))?;
 
     if batch.is_empty() {
         return Ok(());
@@ -100,30 +127,47 @@ async fn run_once(state: &WorkerState) -> anyhow::Result<()> {
 
     for message in batch {
         if let Err(error) = process_message(state, &message).await {
+            let error_chain = format!("{error:#}");
             warn!(
                 outbox_id = %message.id,
                 event_type = %message.event_type,
                 retry_count = message.retry_count,
                 max_retry = state.config.worker_max_retry,
-                error = %error,
+                error = %error_chain,
                 "processing outbox message failed"
             );
-            let reason = truncate_error(&error.to_string());
-            mark_outbox_retry(
-                &state.pool,
-                message.id,
-                message.retry_count,
-                state.config.worker_max_retry,
-                &reason,
-            )
-            .await
+            let reason = truncate_error(&error_chain);
+            match &state.backend {
+                WorkerBackend::Distributed { pool, .. } => {
+                    mark_outbox_retry(
+                        pool,
+                        message.id,
+                        message.retry_count,
+                        state.config.worker_max_retry,
+                        &reason,
+                    )
+                    .await
+                }
+                WorkerBackend::Lite { pool } => {
+                    mark_outbox_retry_sqlite(
+                        pool,
+                        message.id,
+                        message.retry_count,
+                        state.config.worker_max_retry,
+                        &reason,
+                    )
+                    .await
+                }
+            }
             .map_err(|mark_error| anyhow!(mark_error))?;
             continue;
         }
 
-        mark_outbox_done(&state.pool, message.id)
-            .await
-            .map_err(|error| anyhow!(error))?;
+        match &state.backend {
+            WorkerBackend::Distributed { pool, .. } => mark_outbox_done(pool, message.id).await,
+            WorkerBackend::Lite { pool } => mark_outbox_done_sqlite(pool, message.id).await,
+        }
+        .map_err(|error| anyhow!(error))?;
     }
 
     Ok(())
@@ -173,29 +217,29 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
             total_tokens = usage.total_tokens,
             "recorded extraction token usage"
         );
-        persist_llm_usage(
-            &state.pool,
-            &LlmUsageInput {
-                tenant_id: envelope.request.tenant_id.clone(),
-                entity_id: envelope.request.entity_id.clone(),
-                process_id: envelope.request.process_id.clone(),
-                event_type: "ingest".to_owned(),
-                event_id: Some(message.id.to_string()),
-                operation: "extract".to_owned(),
-                provider: "openai-compatible".to_owned(),
-                model: extraction
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| state.config.openai_extract_model.clone()),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                payload: json!({
-                    "outbox_id": message.id.to_string()
-                }),
-            },
-        )
-        .await
+        let usage_input = LlmUsageInput {
+            tenant_id: envelope.request.tenant_id.clone(),
+            entity_id: envelope.request.entity_id.clone(),
+            process_id: envelope.request.process_id.clone(),
+            event_type: "ingest".to_owned(),
+            event_id: Some(message.id.to_string()),
+            operation: "extract".to_owned(),
+            provider: "openai-compatible".to_owned(),
+            model: extraction
+                .model
+                .clone()
+                .unwrap_or_else(|| state.config.openai_extract_model.clone()),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            payload: json!({
+                "outbox_id": message.id.to_string()
+            }),
+        };
+        match &state.backend {
+            WorkerBackend::Distributed { pool, .. } => persist_llm_usage(pool, &usage_input).await,
+            WorkerBackend::Lite { pool } => persist_llm_usage_sqlite(pool, &usage_input).await,
+        }
         .map_err(|error| anyhow!(error))?;
     }
 
@@ -227,30 +271,30 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
             total_tokens = usage.total_tokens,
             "recorded embedding token usage"
         );
-        persist_llm_usage(
-            &state.pool,
-            &LlmUsageInput {
-                tenant_id: envelope.request.tenant_id.clone(),
-                entity_id: envelope.request.entity_id.clone(),
-                process_id: envelope.request.process_id.clone(),
-                event_type: "ingest".to_owned(),
-                event_id: Some(message.id.to_string()),
-                operation: "embed_ingest".to_owned(),
-                provider: "openai-compatible".to_owned(),
-                model: embedding_batch
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| state.config.openai_embedding_model.clone()),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                payload: json!({
-                    "outbox_id": message.id.to_string(),
-                    "input_count": texts.len()
-                }),
-            },
-        )
-        .await
+        let usage_input = LlmUsageInput {
+            tenant_id: envelope.request.tenant_id.clone(),
+            entity_id: envelope.request.entity_id.clone(),
+            process_id: envelope.request.process_id.clone(),
+            event_type: "ingest".to_owned(),
+            event_id: Some(message.id.to_string()),
+            operation: "embed_ingest".to_owned(),
+            provider: "openai-compatible".to_owned(),
+            model: embedding_batch
+                .model
+                .clone()
+                .unwrap_or_else(|| state.config.openai_embedding_model.clone()),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            payload: json!({
+                "outbox_id": message.id.to_string(),
+                "input_count": texts.len()
+            }),
+        };
+        match &state.backend {
+            WorkerBackend::Distributed { pool, .. } => persist_llm_usage(pool, &usage_input).await,
+            WorkerBackend::Lite { pool } => persist_llm_usage_sqlite(pool, &usage_input).await,
+        }
         .map_err(|error| anyhow!(error))?;
     }
     let vectors = embedding_batch.vectors;
@@ -272,9 +316,11 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
             ));
         }
 
-        let memory_id = upsert_memory_item(&state.pool, &memory)
-            .await
-            .map_err(|error| anyhow!(error))?;
+        let memory_id = match &state.backend {
+            WorkerBackend::Distributed { pool, .. } => upsert_memory_item(pool, &memory).await,
+            WorkerBackend::Lite { pool } => upsert_memory_item_sqlite(pool, &memory).await,
+        }
+        .map_err(|error| anyhow!(error))?;
         let namespace = build_namespace(&memory.tenant_id, &memory.entity_id, &memory.process_id);
 
         let metadata = json!({
@@ -287,34 +333,44 @@ async fn process_ingest(state: &WorkerState, message: &OutboxMessage) -> anyhow:
             "collection": state.config.qdrant_collection(),
         });
 
-        persist_embedding(
-            &state.pool,
-            &EmbeddingRecord {
-                memory_id,
-                tenant_id: memory.tenant_id.clone(),
-                namespace,
-                model: state.config.openai_embedding_model.clone(),
-                dims: state.config.embedding_dims as i32,
-                embedding: json!(vector),
-                recall_text: memory.content.clone(),
-                metadata: metadata.clone(),
-            },
-        )
-        .await
-        .map_err(|error| anyhow!(error))?;
+        let record = EmbeddingRecord {
+            memory_id,
+            tenant_id: memory.tenant_id.clone(),
+            namespace,
+            model: state.config.openai_embedding_model.clone(),
+            dims: state.config.embedding_dims as i32,
+            embedding: json!(vector),
+            recall_text: memory.content.clone(),
+            metadata: metadata.clone(),
+        };
 
-        state
-            .qdrant
-            .upsert_point(memory_id, &vector, metadata)
-            .await
-            .with_context(|| format!("qdrant upsert failed for memory_id={memory_id}"))?;
+        match &state.backend {
+            WorkerBackend::Distributed { pool, qdrant } => {
+                persist_embedding(pool, &record)
+                    .await
+                    .map_err(|error| anyhow!(error))?;
+                qdrant
+                    .upsert_point(memory_id, &vector, metadata)
+                    .await
+                    .with_context(|| format!("qdrant upsert failed for memory_id={memory_id}"))?;
+            }
+            WorkerBackend::Lite { pool } => {
+                persist_embedding_sqlite(pool, &record, &vector)
+                    .await
+                    .map_err(|error| anyhow!(error))?;
+            }
+        }
     }
 
     Ok(())
 }
 
 async fn reconcile_once(state: &WorkerState) -> anyhow::Result<()> {
-    let candidates = list_reconcile_candidates(&state.pool, state.config.reconcile_batch_size)
+    let (pool, qdrant) = match &state.backend {
+        WorkerBackend::Distributed { pool, qdrant } => (pool, qdrant),
+        WorkerBackend::Lite { .. } => return Ok(()),
+    };
+    let candidates = list_reconcile_candidates(pool, state.config.reconcile_batch_size)
         .await
         .map_err(|error| anyhow!(error))?;
     if candidates.is_empty() {
@@ -365,8 +421,7 @@ async fn reconcile_once(state: &WorkerState) -> anyhow::Result<()> {
             Value::String(state.config.qdrant_collection()),
         );
 
-        state
-            .qdrant
+        qdrant
             .upsert_point(
                 candidate.memory_id,
                 &candidate.vector,
@@ -420,7 +475,7 @@ impl OpenAiExtractor {
             base_url: config.openai_base_url.clone(),
             api_key: config.openai_api_key.clone(),
             model: config.openai_extract_model.clone(),
-            client: reqwest::Client::new(),
+            client: build_openai_client(),
         }
     }
 
@@ -496,6 +551,7 @@ When only day-level or day-part information is available, set time_precision=coa
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&body)
+            .timeout(Duration::from_secs(75))
             .send()
             .await?;
 
@@ -546,6 +602,11 @@ fn parse_extracted_items(
     request: &IngestRequest,
 ) -> anyhow::Result<Vec<ExtractedMemory>> {
     let parsed = serde_json::from_str::<Value>(content)
+        .or_else(|_| {
+            extract_first_json_value(content)
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no json value found")))
+                .and_then(|fragment| serde_json::from_str::<Value>(&fragment))
+        })
         .or_else(|_| serde_json::from_str::<Value>(&extract_json_fragment(content)))
         .map_err(|error| {
             anyhow!(
@@ -664,6 +725,73 @@ fn extract_json_fragment(raw: &str) -> String {
     let start = raw.find('{').unwrap_or(0);
     let end = raw.rfind('}').map(|index| index + 1).unwrap_or(raw.len());
     raw[start..end].to_owned()
+}
+
+fn extract_first_json_value(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut start = None;
+    let mut quote = false;
+    let mut escape = false;
+    let mut depth_curly = 0usize;
+    let mut depth_square = 0usize;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        let ch = *byte as char;
+        if start.is_none() {
+            if ch == '{' || ch == '[' {
+                start = Some(index);
+                if ch == '{' {
+                    depth_curly = 1;
+                } else {
+                    depth_square = 1;
+                }
+            }
+            continue;
+        }
+
+        if quote {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == '"' {
+                quote = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                quote = true;
+            }
+            '{' => {
+                depth_curly += 1;
+            }
+            '}' => {
+                depth_curly = depth_curly.saturating_sub(1);
+            }
+            '[' => {
+                depth_square += 1;
+            }
+            ']' => {
+                depth_square = depth_square.saturating_sub(1);
+            }
+            _ => {}
+        }
+
+        if depth_curly == 0
+            && depth_square == 0
+            && let Some(begin) = start
+        {
+            return Some(raw[begin..=index].to_owned());
+        }
+    }
+
+    None
 }
 
 fn normalize_memory_type(raw: Option<&str>) -> &'static str {
@@ -875,7 +1003,7 @@ impl OpenAiEmbedder {
             api_key: config.openai_api_key.clone(),
             model: config.openai_embedding_model.clone(),
             dims: config.embedding_dims,
-            client: reqwest::Client::new(),
+            client: build_openai_client(),
         }
     }
 
@@ -900,6 +1028,7 @@ impl OpenAiEmbedder {
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request_body)
+            .timeout(Duration::from_secs(45))
             .send()
             .await?;
 
@@ -946,6 +1075,14 @@ impl OpenAiEmbedder {
             model,
         })
     }
+}
+
+fn build_openai_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(75))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn parse_openai_usage(body: &Value) -> Option<OpenAiUsage> {

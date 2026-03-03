@@ -90,8 +90,15 @@ flowchart LR
 
 ```bash
 git clone https://github.com/Mgrsc/MemBurrow.git && cd MemBurrow
-cp .env.example .env  # 设置 OPENAI_API_KEY
+cp .env.lite.example .env  # 默认 lite 配置，设置 OPENAI_API_KEY
 docker compose up -d
+```
+
+分布式配置：
+
+```bash
+cp .env.distributed.example .env
+docker compose --profile distributed up -d
 ```
 
 验证：
@@ -148,8 +155,8 @@ curl -s -X POST http://localhost:8080/v1/memory/recall \
 |---|---|
 | 语言 | Rust |
 | HTTP 框架 | Axum |
-| 数据库 | PostgreSQL + SQLx |
-| 向量索引 | Qdrant |
+| 数据库 | SQLite（lite）/ PostgreSQL（distributed）+ SQLx |
+| 向量索引 | sqlite-vector（lite）/ Qdrant（distributed） |
 | LLM / Embedding | OpenAI 兼容 API |
 | 部署 | Docker Compose |
 
@@ -166,9 +173,11 @@ MemBurrow/
 ├── crates/
 │   └── memory-core/         # 共享领域逻辑、模型、存储
 ├── migrations/              # SQL 迁移文件
+├── migrations_sqlite/       # SQLite 迁移文件
 ├── docker-compose.yml
 ├── Dockerfile
-└── .env.example
+├── .env.lite.example
+└── .env.distributed.example
 ```
 
 ## 配置
@@ -180,7 +189,7 @@ MemBurrow/
 
 | 变量 | 说明 |
 |---|---|
-| `DATABASE_URL` | PostgreSQL 连接字符串 |
+| `BACKEND_PROFILE` | `lite` 或 `distributed` |
 | `API_AUTH_TOKEN` | API 认证 Bearer Token |
 | `OPENAI_API_KEY` | LLM 和 Embedding 调用的 API Key |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 基础 URL（若设置，必须以 `/v1` 结尾） |
@@ -189,8 +198,12 @@ MemBurrow/
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `SQLITE_DATABASE_URL` | `sqlite://./data/memburrow.db` | SQLite 数据库地址（lite） |
+| `SQLITE_VECTOR_EXTENSION_PATH` | `/usr/local/lib/sqlite-vector/vector.so` | sqlite-vector 扩展路径（lite） |
+| `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout（毫秒） |
+| `DATABASE_URL` | `` | PostgreSQL 连接字符串（distributed） |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP 端点（distributed） |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API 监听地址 |
-| `QDRANT_URL` | `http://qdrant:6333` | Qdrant gRPC/HTTP 端点 |
 | `OPENAI_EXTRACT_MODEL` | `gpt-4o-mini` | 记忆抽取模型 |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding 模型 |
 | `EMBEDDING_DIMS` | `1536` | Embedding 维度（必须与模型输出一致） |

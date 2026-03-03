@@ -1,5 +1,7 @@
 use anyhow::Context;
-use memory_core::{MIGRATOR, ServiceConfig, connect_pool};
+use memory_core::{
+    BackendProfile, PG_MIGRATOR, SQLITE_MIGRATOR, ServiceConfig, connect_pool, connect_sqlite_pool,
+};
 use tracing::info;
 
 #[tokio::main]
@@ -7,14 +9,26 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env().context("failed to load configuration")?;
     init_tracing(&config.log_format);
 
-    let pool = connect_pool(&config.database_url)
-        .await
-        .context("failed to connect database")?;
-
-    MIGRATOR
-        .run(&pool)
-        .await
-        .context("migration execution failed")?;
+    match config.backend_profile {
+        BackendProfile::Distributed => {
+            let pool = connect_pool(&config.database_url)
+                .await
+                .context("failed to connect postgres database")?;
+            PG_MIGRATOR
+                .run(&pool)
+                .await
+                .context("postgres migration execution failed")?;
+        }
+        BackendProfile::Lite => {
+            let pool = connect_sqlite_pool(&config)
+                .await
+                .context("failed to connect sqlite database")?;
+            SQLITE_MIGRATOR
+                .run(&pool)
+                .await
+                .context("sqlite migration execution failed")?;
+        }
+    }
 
     info!("migrations completed");
     Ok(())
