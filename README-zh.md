@@ -94,6 +94,12 @@ cp .env.lite.example .env  # 默认 lite 配置，设置 OPENAI_API_KEY
 docker compose up -d
 ```
 
+如果使用本地目录挂载 SQLite 数据目录（例如 `./data:/app/data`），请确保：
+
+- 使用容器内绝对路径配置 SQLite URL：`SQLITE_DATABASE_URL=sqlite:///app/data/memburrow.db`
+- 宿主机目录已创建且可写：`mkdir -p ./data`
+- 镜像运行用户为 `appuser`（UID `10001`），挂载目录需要对该 UID 可写；否则可能报错：`(code: 14) unable to open database file`
+
 分布式配置：
 
 ```bash
@@ -198,7 +204,7 @@ MemBurrow/
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `SQLITE_DATABASE_URL` | `sqlite://./data/memburrow.db` | SQLite 数据库地址（lite） |
+| `SQLITE_DATABASE_URL` | `sqlite:///app/data/memburrow.db` | SQLite 数据库地址（lite，Docker 推荐） |
 | `SQLITE_VECTOR_EXTENSION_PATH` | `/usr/local/lib/sqlite-vector/vector.so` | sqlite-vector 扩展路径（lite） |
 | `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout（毫秒） |
 | `DATABASE_URL` | `` | PostgreSQL 连接字符串（distributed） |

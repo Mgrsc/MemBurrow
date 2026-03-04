@@ -94,6 +94,12 @@ cp .env.lite.example .env  # lite profile by default, set OPENAI_API_KEY
 docker compose up -d
 ```
 
+If you bind-mount a host directory for SQLite data (for example `./data:/app/data`), make sure:
+
+- Use an absolute in-container SQLite URL: `SQLITE_DATABASE_URL=sqlite:///app/data/memburrow.db`
+- The host directory exists and is writable: `mkdir -p ./data`
+- The image runs as `appuser` (UID `10001`), so the mounted directory must be writable by that UID; otherwise SQLite may fail with `(code: 14) unable to open database file`
+
 Distributed profile:
 
 ```bash
@@ -198,7 +204,7 @@ MemBurrow/
 
 | Variable | Default | Description |
 |---|---|---|
-| `SQLITE_DATABASE_URL` | `sqlite://./data/memburrow.db` | SQLite database URL (lite profile) |
+| `SQLITE_DATABASE_URL` | `sqlite:///app/data/memburrow.db` | SQLite database URL (lite profile, Docker recommended) |
 | `SQLITE_VECTOR_EXTENSION_PATH` | `/usr/local/lib/sqlite-vector/vector.so` | sqlite-vector extension path (lite profile) |
 | `SQLITE_BUSY_TIMEOUT_MS` | `5000` | SQLite busy timeout in milliseconds |
 | `DATABASE_URL` | `` | PostgreSQL connection string (distributed profile) |
